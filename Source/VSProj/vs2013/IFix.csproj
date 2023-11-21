@@ -66,6 +66,9 @@
     <Compile Include="..\Src\Tools\GenerateConfigure.cs">
       <Link>Src\Tools\GenerateConfigure.cs</Link>
     </Compile>
+    <Compile Include="..\Src\Tools\WrapMethod.cs">
+      <Link>Src\Tools\WrapMethod.cs</Link>
+    </Compile>
     <Compile Include="..\Src\Version.cs">
       <Link>Src\Version.cs</Link>
     </Compile>
