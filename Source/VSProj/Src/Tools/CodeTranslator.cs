@@ -972,7 +972,7 @@ namespace IFix
                     ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Box, ptype));
                 }
             }
-            ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, redirectTo));
+            ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, redirectTo.Method));
         }
 
         //id注入方式处理逻辑
@@ -1023,7 +1023,7 @@ namespace IFix
                     ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Box, ptype));
                 }
             }
-            ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, redirectTo));
+            ilProcessor.InsertBefore(insertPoint, Instruction.Create(OpCodes.Callvirt, redirectTo.Method));
         }
 
         void injectMethod(MethodDefinition method, int methodId)
@@ -2025,7 +2025,7 @@ namespace IFix
 
         private MethodReference idTagCtor_Ref;
 
-        private List<MethodDefinition> wrapperMethods;
+        // private List<MethodDefinition> wrapperMethods;
 
         private Dictionary<TypeReference, MethodReference> pushMap =
             new Dictionary<TypeReference, MethodReference>();
@@ -2161,8 +2161,8 @@ namespace IFix
                     //Console.WriteLine("add slot " + matchItfMethod + ",m=" + method);
                     interfaceSlot.Add(matchItfMethod, bridgeMethodId);
                     var impl = getWrapperMethod(itfBridgeType, null, method, false, true, true, bridgeMethodId);
-                    addIDTag(impl, bridgeMethodId++);
-                    impl.Overrides.Add(matchItfMethod);
+                    addIDTag(impl.Method, bridgeMethodId++);
+                    impl.Method.Overrides.Add(matchItfMethod);
                 }
 
             }
@@ -2203,8 +2203,8 @@ namespace IFix
                 var methodToImpl = itf.IsGenericInstance ? method.MakeGeneric(itf) : method.TryImport(itf.Module);
                 interfaceSlot.Add(methodToImpl, bridgeMethodId);
                 var impl = getWrapperMethod(itfBridgeType, null, methodToImpl, false, true, true, bridgeMethodId);
-                addIDTag(impl, bridgeMethodId++);
-                impl.Overrides.Add(methodToImpl);
+                addIDTag(impl.Method, bridgeMethodId++);
+                impl.Method.Overrides.Add(methodToImpl);
             }
             bridgeImplement(itf);
             foreach (var ii in itfDef.Interfaces)
@@ -2315,9 +2315,50 @@ namespace IFix
 
             instructions.Add(Instruction.Create(OpCodes.Ret));
             itfBridgeType.Methods.Add(targetMethod);
+        }                           
+        
+        TypeReference ReduceReturnType(TypeReference type)
+        {
+            if (type.IsArray)
+                return objType;
+            if (type.IsPrimitive || type.IsSameType(voidType))
+                return type;
+            if (type.Resolve().IsEnum)
+            {
+                return tryGetUnderlyingType(type);
+            }
+            if (type.IsValueType)
+                return type;
+            return objType;
         }
 
+        TypeReference ReduceParamType(TypeReference type)
+        {
+            if (type.IsByReference)
+            {
+                return type;
+            }
 
+            //integer type
+            if (type.IsPrimitive)
+            {
+                switch (type.FullName)
+                {
+                    //signed 
+                    case "System.Int16":
+                    case "System.Char":
+                    case "System.SByte":
+                    //unsigned
+                    case "System.Byte":
+                    case "System.UInt16":
+                    case "System.UInt32":
+                        return assembly.MainModule.TypeSystem.Int32;
+                }
+            }
+            return ReduceReturnType(type);
+        }
+
+        private Dictionary<WrapperMethod, KeyValuePair<WrapperMethod,List<MethodReference>>> _wrapperMethodUsed = new Dictionary<WrapperMethod, KeyValuePair<WrapperMethod, List<MethodReference>>>();
         /// <summary>
         /// 获取一个方法的适配器
         /// </summary>
@@ -2330,7 +2371,7 @@ namespace IFix
         /// <param name="mid">方法id</param>
         /// <returns></returns>
         // #lizard forgives
-        MethodDefinition getWrapperMethod(TypeDefinition type, FieldDefinition anonObj, MethodReference method,
+        WrapperMethod getWrapperMethod(TypeDefinition type, FieldDefinition anonObj, MethodReference method,
             bool isClosure, bool noBaselize, bool isInterfaceBridge = false, int mid = -1)
         {
             MethodDefinition md = method as MethodDefinition;
@@ -2338,54 +2379,66 @@ namespace IFix
             {
                 md = method.Resolve();
             }
+            
+            var wrapperMethod = new WrapperMethod();
+            
             //原始参数类型
             List<TypeReference> parameterTypes = new List<TypeReference>();
             //适配器参数类型，不是强制noBaselize的话，引用类型，复杂非引用值类型，均转为object
-            List<TypeReference> wrapperParameterTypes = new List<TypeReference>();
-            List<bool> isOut = new List<bool>();
-            List<bool> isIn = new List<bool>();
+            // List<TypeReference> wrapperParameterTypes = new List<TypeReference>();
+            // List<bool> isOut = new List<bool>();
+            // List<bool> isIn = new List<bool>();
             //List<ParameterAttributes> paramAttrs = new List<ParameterAttributes>();
+            // 传入this
             if (!md.IsStatic && !isClosure && !isInterfaceBridge) //匿名类闭包的this是自动传，不需要显式参数
             {
-                isOut.Add(false);
-                isIn.Add(false);
                 //paramAttrs.Add(Mono.Cecil.ParameterAttributes.None);
                 if (method.DeclaringType.IsValueType)
                 {
+                    // 值类型需要引用传递
                     var dt = new ByReferenceType(method.DeclaringType);
                     parameterTypes.Add(dt);
-                    wrapperParameterTypes.Add(dt);
+                    wrapperMethod.AddParameter(false, false, dt);
                 }
                 else
                 {
+                    // 直接传自己
                     parameterTypes.Add(method.DeclaringType);
-                    wrapperParameterTypes.Add(noBaselize ? method.DeclaringType
-                        : wrapperParamerterType(method.DeclaringType));
+                    // 对wrapper的进行类型擦除
+                    wrapperMethod.AddParameter(false, false, noBaselize ? method.DeclaringType : wrapperParamerterType(method.DeclaringType));
                 }
             }
 
+            // 遍历所有参数
             for (int i = 0; i < method.Parameters.Count; i++)
             {
-                isOut.Add(method.Parameters[i].IsOut);
-                isIn.Add(method.Parameters[i].IsIn);
+                // 记录in out
                 //paramAttrs.Add(method.Parameters[i].Attributes);
                 var paramType = method.Parameters[i].ParameterType;
                 if (paramType.IsGenericParameter)
                 {
                     paramType = (paramType as GenericParameter).ResolveGenericArgument(method.DeclaringType);
                 }
+                // 包含修饰符（指针、引用、数组）就用其ElementType
                 if (paramType.IsRequiredModifier)
                 {
                     paramType = (paramType as RequiredModifierType).ElementType;
                 }
                 parameterTypes.Add(paramType);
-                wrapperParameterTypes.Add(noBaselize ? paramType : wrapperParamerterType(paramType));
+                wrapperMethod.AddParameter(method.Parameters[i].IsIn, method.Parameters[i].IsOut, noBaselize ? paramType : ReduceParamType(paramType));
             }
 
-            var returnType = method.ReturnType.FillGenericArgument(method, method.DeclaringType);
+            {
+                // 处理返回值
+                var returnType = method.ReturnType.FillGenericArgument(method, method.DeclaringType);
+                if (!isClosure)
+                    returnType = ReduceReturnType(returnType);
+                wrapperMethod.FinalReturn(returnType);
+            }
+           
 
-            MethodDefinition wrapperMethod;
 
+            // 如果是interface
             if (isInterfaceBridge)
             {
                 var attributes = md.Attributes;
@@ -2397,52 +2450,38 @@ namespace IFix
                     methodName = System.Text.RegularExpressions.Regex.Replace(method.DeclaringType.FullName,
                         @"`\d+", "") + "." + methodName;
                 }
-                wrapperMethod = new MethodDefinition(methodName, attributes,
-                    returnType.TryImport(assembly.MainModule));
+                // 创建wrapper函数
+                wrapperMethod.Method = new MethodDefinition(methodName, attributes,
+                    wrapperMethod.ReturnType.TryImport(assembly.MainModule));
             }
             else
             {
-                List<MethodDefinition> cacheToCheck = wrapperMethods;
-                for (int i = 0; i < cacheToCheck.Count; i++)
+                if (_wrapperMethodUsed.TryGetValue(wrapperMethod, out var methodPair))
                 {
-                    wrapperMethod = cacheToCheck[i];
-                    if (wrapperMethod.Parameters.Count != wrapperParameterTypes.Count
-                        || !wrapperMethod.ReturnType.IsSameType(returnType))
-                    {
-                        continue;
-                    }
-                    bool paramMatch = true;
-                    for (int j = 0; j < wrapperParameterTypes.Count; j++)
-                    {
-                        if (!wrapperParameterTypes[j].IsSameType(wrapperMethod.Parameters[j].ParameterType)
-                            || isOut[j] != wrapperMethod.Parameters[j].IsOut || isIn[j] != wrapperMethod.Parameters[j].IsIn)
-                        {
-                            paramMatch = false;
-                            break;
-                        }
-                    }
-                    if (!paramMatch)
-                    {
-                        continue;
-                    }
-                    return wrapperMethod;
+                    methodPair.Value.Add(method);
+                    return methodPair.Key;
                 }
-                wrapperMethod = new MethodDefinition(Wrap_Perfix + cacheToCheck.Count,
-                    Mono.Cecil.MethodAttributes.Public, returnType.TryImport(assembly.MainModule));
-                cacheToCheck.Add(wrapperMethod);
+                
+                wrapperMethod.Method = new MethodDefinition(Wrap_Perfix + _wrapperMethodUsed.Count,
+                    Mono.Cecil.MethodAttributes.Public, wrapperMethod.ReturnType.TryImport(assembly.MainModule));
+                var methods = new List<MethodReference>() { method };
+
+                _wrapperMethodUsed.Add(wrapperMethod,new KeyValuePair<WrapperMethod, List<MethodReference>>(wrapperMethod,methods));
             }
             var instructions = wrapperMethod.Body.Instructions;
 
+            // 查看引用的数量
             int refCount = 0;
             int[] refPos = new int[parameterTypes.Count];
 
+            // 添加paramter
             for (int i = 0; i < parameterTypes.Count; i++)
             {
                 refPos[i] = (parameterTypes[i].IsByReference) ? refCount++ : -1;
                 var parameterAttributes = ParameterAttributes.None;
-                if (isOut[i]) parameterAttributes |= ParameterAttributes.Out;
-                if (isIn[i]) parameterAttributes |= ParameterAttributes.In;
-                wrapperMethod.Parameters.Add(new ParameterDefinition("P" + i, parameterAttributes, wrapperParameterTypes[i].TryImport(assembly.MainModule)));
+                if (wrapperMethod.Outs[i]) parameterAttributes |= ParameterAttributes.Out;
+                if (wrapperMethod.Ins[i]) parameterAttributes |= ParameterAttributes.In;
+                wrapperMethod.Method.Parameters.Add(new ParameterDefinition("P" + i, parameterAttributes, wrapperMethod.Parameters[i].TryImport(assembly.MainModule)));
             }
 
             var ilProcessor = wrapperMethod.Body.GetILProcessor();
@@ -2450,38 +2489,44 @@ namespace IFix
             VariableDefinition call = new VariableDefinition(Call_Ref);
             wrapperMethod.Body.Variables.Add(call);
 
+            // 调用BeginCall
             instructions.Add(Instruction.Create(OpCodes.Call, Call_Begin_Ref));
-            instructions.Add(Instruction.Create(OpCodes.Stloc, call));
+            instructions.Add(Instruction.Create(OpCodes.Stloc, call));  // 保存返回值 
 
+            // 有ref
+            // 需要先push一个参数进去
             if (refCount > 0)
             {
                 for (int i = 0; i < parameterTypes.Count; i++)
                 {
+                    // 如果有ref的参数
                     if (parameterTypes[i].IsByReference)
                     {
                         var paramRawType = tryGetUnderlyingType(getRawType(parameterTypes[i]));
-                        if (isOut[i]) // push default
+                        if (wrapperMethod.Outs[i]) // push default
                         {
-                            instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
+                            // ((Call)(ref val)).PushDouble(0.0);
+                            // 加载call
+                            instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call)); // 加载call
                             MethodReference push;
-                            var wpt = wrapperParamerterType(paramRawType);
+                            var wpt = wrapperParamerterType(paramRawType); // 退化paramter
                             wpt = (wpt.IsValueType && !wpt.IsPrimitive) ? objType : wpt;
                             if (pushMap.TryGetValue(wpt, out push))
                             {
                                 if (wpt == assembly.MainModule.TypeSystem.Object)
                                 {
-                                    instructions.Add(Instruction.Create(OpCodes.Ldnull));
+                                    instructions.Add(Instruction.Create(OpCodes.Ldnull));// null
                                 }
                                 else
                                 {
-                                    instructions.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+                                    instructions.Add(Instruction.Create(OpCodes.Ldc_I4_0)); // 0
                                 }
                                 if (wpt == assembly.MainModule.TypeSystem.Int64
                                     || wpt == assembly.MainModule.TypeSystem.UInt64
                                     || wpt == assembly.MainModule.TypeSystem.IntPtr
                                     || wpt == assembly.MainModule.TypeSystem.UIntPtr)
                                 {
-                                    instructions.Add(Instruction.Create(OpCodes.Conv_I8));
+                                    instructions.Add(Instruction.Create(OpCodes.Conv_I8)); //
                                     push = pushMap[assembly.MainModule.TypeSystem.Int64];
                                 }
                                 else if (wpt == assembly.MainModule.TypeSystem.Single)
@@ -2512,6 +2557,7 @@ namespace IFix
                         }
                         else
                         {
+                            // ((Call)(ref val)).PushDouble(P1);
                             instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
                             emitLdarg(instructions, ilProcessor, i + 1);
                             emitLoadRef(instructions, paramRawType);
@@ -2537,6 +2583,7 @@ namespace IFix
                 }
             }
 
+            // push this
             if (isInterfaceBridge)
             {
                 instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
@@ -2545,32 +2592,37 @@ namespace IFix
             }
             else
             {
-                instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-                instructions.Add(Instruction.Create(OpCodes.Ldfld, anonObj));
+                instructions.Add(Instruction.Create(OpCodes.Ldarg_0)); // self
+                instructions.Add(Instruction.Create(OpCodes.Ldfld, anonObj)); // anon
 
                 var nop = Instruction.Create(OpCodes.Nop);
-                instructions.Add(Instruction.Create(OpCodes.Brfalse_S, nop));
+                instructions.Add(Instruction.Create(OpCodes.Brfalse_S, nop)); // anon == null
 
+                // ((Call)(ref val)).PushObject(anonObj);
                 instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
                 instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
                 instructions.Add(Instruction.Create(OpCodes.Ldfld, anonObj));
                 instructions.Add(Instruction.Create(OpCodes.Callvirt, pushMap[assembly.MainModule.TypeSystem.Object]));
+                // jump target
                 instructions.Add(nop);
             }
 
+            // 遍历所有参数
             for (int i = 0; i < parameterTypes.Count; i++)
             {
                 instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
 
                 if (parameterTypes[i].IsByReference)
                 {
+                    // ((Call)(ref val)).PushRef(0);
                     emitLdcI4(instructions, refPos[i]);
                     instructions.Add(Instruction.Create(OpCodes.Callvirt, Call_PushRef_Ref));
                 }
                 else
                 {
+                    // ((Call)(ref val)).PushObject(P0);
                     emitLdarg(instructions, ilProcessor, i + 1);
-                    var paramRawType = getRawType(wrapperParameterTypes[i]);
+                    var paramRawType = getRawType(wrapperMethod.Parameters[i]);
                     MethodReference push;
                     if (pushMap.TryGetValue(tryGetUnderlyingType(paramRawType), out push))
                     {
@@ -2595,31 +2647,33 @@ namespace IFix
                 }
             }
 
-            instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
+            instructions.Add(Instruction.Create(OpCodes.Ldarg_0)); // self
             instructions.Add(Instruction.Create(OpCodes.Ldfld, isInterfaceBridge ?
-                virualMachineFieldOfBridge : virualMachineFieldOfWrapper));
+                virualMachineFieldOfBridge : virualMachineFieldOfWrapper)); // virtualMachine
             if (isInterfaceBridge)
             {
                 var methodId = new FieldDefinition(METHODIDPERFIX + mid, FieldAttributes.Private,
                     assembly.MainModule.TypeSystem.Int32);
                 type.Fields.Add(methodId);
-                instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-                instructions.Add(Instruction.Create(OpCodes.Ldfld, methodId));
+                instructions.Add(Instruction.Create(OpCodes.Ldarg_0)); // self(ILInterfaceBridge)
+                instructions.Add(Instruction.Create(OpCodes.Ldfld, methodId)); // methodId
             }
             else
             {
-                instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-                instructions.Add(Instruction.Create(OpCodes.Ldfld, methodIdFieldOfWrapper));
+                instructions.Add(Instruction.Create(OpCodes.Ldarg_0)); // self(ILFixDynamicMethodWrapper)
+                instructions.Add(Instruction.Create(OpCodes.Ldfld, methodIdFieldOfWrapper)); // methodId
             }
-            instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
+            instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call)); // val
 
             var ldci4_ref_count = createLdcI4(refCount);
             if (isInterfaceBridge)
             {
-                emitLdcI4(instructions, parameterTypes.Count + 1);
+                emitLdcI4(instructions, parameterTypes.Count + 1); // 确定的参数数量
             }
             else
             {
+                // 判断是否有匿名对象，确定参数数量
+                // (anonObj != null) ? 3 : 2
                 instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
                 instructions.Add(Instruction.Create(OpCodes.Ldfld, anonObj));
                 var ldci4_param_count = createLdcI4(parameterTypes.Count + 1);
@@ -2628,57 +2682,61 @@ namespace IFix
                 instructions.Add(Instruction.Create(OpCodes.Br_S, ldci4_ref_count));
                 instructions.Add(ldci4_param_count);
             }
-            instructions.Add(ldci4_ref_count);
+            instructions.Add(ldci4_ref_count); // 引用数量
             
-            instructions.Add(Instruction.Create(OpCodes.Callvirt, VirtualMachine_Execute_Ref));
+            instructions.Add(Instruction.Create(OpCodes.Callvirt, VirtualMachine_Execute_Ref)); // 调用Execute
 
+            // 有ref的情况下将结果赋值
+            // P1 = ((Call)(ref val)).GetInt32(0);
             if (refCount > 0)
             {
 
                 // Ref param
                 for (int i = 0; i < parameterTypes.Count; i++)
                 {
-                    if (parameterTypes[i].IsByReference && ! isIn[i])
+                    if (parameterTypes[i].IsByReference && !wrapperMethod.Ins[i])
                     {
-                        emitLdarg(instructions, ilProcessor, i + 1);
+                        emitLdarg(instructions, ilProcessor, i + 1); // P1
                         var paramRawType = tryGetUnderlyingType(getRawType(parameterTypes[i]));
-                        instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
+                        instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call)); // P1 val 
 
-                        emitLdcI4(instructions, refPos[i]);
+                        emitLdcI4(instructions, refPos[i]); // P1 val refPos
+                        // 如果是基本类型
                         if (paramRawType.IsPrimitive && getMap.ContainsKey(paramRawType.Resolve()))
                         {
-                            instructions.Add(Instruction.Create(OpCodes.Callvirt, getMap[paramRawType.Resolve()]));
+                            instructions.Add(Instruction.Create(OpCodes.Callvirt, getMap[paramRawType.Resolve()])); // P1 GetXXX()
                         }
                         else
                         {
                             instructions.Add(Instruction.Create(OpCodes.Callvirt,
-                                makeGenericMethod(Call_GetAsType_Ref, paramRawType)));
+                                makeGenericMethod(Call_GetAsType_Ref, paramRawType)));  // P1 GetAsType()
                         }
-                        emitStoreRef(instructions, paramRawType);
+                        emitStoreRef(instructions, paramRawType); // P1 = XXX 
                     }
                 }
             }
 
-            if (!returnType.IsSameType(voidType))
+            // return result
+            if (!wrapperMethod.ReturnType.IsSameType(voidType)) 
             {
-                instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call));
+                instructions.Add(Instruction.Create(OpCodes.Ldloca_S, call)); // val
                 MethodReference get;
-                emitLdcI4(instructions, refCount);
-                var returnRawType = tryGetUnderlyingType(returnType);
-                if (returnRawType.IsPrimitive && getMap.TryGetValue(returnRawType.Resolve(), out get))
+                emitLdcI4(instructions, refCount); // val refcount
+                var returnRawType = tryGetUnderlyingType(wrapperMethod.ReturnType);
+                if (getMap.TryGetValue(returnRawType.Resolve(), out get))
                 {
-                    instructions.Add(Instruction.Create(OpCodes.Callvirt, get));
+                    instructions.Add(Instruction.Create(OpCodes.Callvirt, get)); // GetXXX
                 }
                 else
                 {
                     instructions.Add(Instruction.Create(OpCodes.Callvirt,
-                        makeGenericMethod(Call_GetAsType_Ref, returnType)));
+                        makeGenericMethod(Call_GetAsType_Ref, wrapperMethod.ReturnType))); //  GetAsType
                 }
             }
 
-            instructions.Add(Instruction.Create(OpCodes.Ret));
+            instructions.Add(Instruction.Create(OpCodes.Ret)); // Ret
 
-            type.Methods.Add(wrapperMethod);
+            type.Methods.Add(wrapperMethod.Method);
 
             return wrapperMethod;
         }
@@ -2900,7 +2958,7 @@ namespace IFix
             idMapType = null;
             //end init idMapper
 
-            wrapperMethods = new List<MethodDefinition>();
+            //wrapperMethods = new List<MethodDefinition>();
 
             TypeDefinition Call;
             Call = ilfixAassembly.MainModule.Types.Single(t => t.Name == "Call");
